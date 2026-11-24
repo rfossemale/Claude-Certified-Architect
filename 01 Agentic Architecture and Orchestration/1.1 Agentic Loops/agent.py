@@ -63,7 +63,8 @@ def run_agent(user_prompt: str) -> str:
                     continue
 
                 tool_fn = TOOL_FUNCTIONS[block.name]
-                # los signos de ** se usan para desempaquetar el diccionario de entrada como argumentos de la función.
+                # los signos de ** se usan para desempaquetar el diccionario de 
+                # entrada como argumentos de la función.
                 output = tool_fn(**block.input)
                 print(f"    -> tool {block.name}({block.input}) = {output}")
 

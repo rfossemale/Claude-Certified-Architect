@@ -27,14 +27,30 @@ Por eso `decompose()`:
   - Pide explícitamente cubrir TODO el alcance (establecido, emergente, experimental).
   - Usa structured outputs (JSON Schema) para recibir una lista parseable, no texto libre.
   - Valida en código que haya al menos MIN_SUBTOPICS; si no, re-pide diciendo por qué.
+
+Paso 3 - Delegación a los subagentes (ver subagents.py).
+
+`delegate()` es el hub en acción: por cada subtema llama al web agent, toma
+sus hallazgos y se los PASA al agente de análisis. Los spokes nunca se hablan
+entre sí; todo pasa por acá. Los subtemas son independientes, así que se
+delegan en paralelo.
 """
 
 import json
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
 import anthropic
 
-MODEL = "claude-opus-5-5"
+from claude_client import call_claude
+from subagents import document_analysis_agent, web_search_agent
+
+# Objetivo que el coordinador transmite a cada subagente. Sin esto, un subagente
+# aislado no sabe para qué sirve su parte ni con qué profundidad investigar.
+DEFAULT_GOAL = (
+    "Producir un reporte comparativo que permita entender el panorama completo "
+    "del tema: cada alternativa, su funcionamiento, madurez, ventajas y limitaciones."
+)
 
 # Mínimo de subtemas que exige el enunciado. Menos que esto = descomposición estrecha.
 MIN_SUBTOPICS = 5
@@ -110,39 +126,6 @@ class ResearchReport:
         return "\n".join(lines)
 
 
-def call_claude(
-    client: anthropic.Anthropic, system: str, prompt: str, schema: dict | None = None
-) -> str:
-    """Una llamada a Claude sin historial previo: devuelve el texto final.
-
-    Cada llamada arranca de cero (solo `system` + `prompt`). Esto va a ser
-    clave en el Paso 3: un subagente solo sabe lo que va en su prompt.
-
-    Si se pasa `schema`, la respuesta es JSON válido según ese esquema.
-    """
-    extra = {}
-    if schema is not None:
-        extra["output_config"] = {"format": {"type": "json_schema", "schema": schema}}
-
-    response = client.beta.messages.create(
-        model=MODEL,
-        max_tokens=16000,
-        system=system,
-        messages=[{"role": "user", "content": prompt}],
-        # Si Claude rechaza la solicitud por política, la API reintenta sola con
-        # un modelo de respaldo dentro de la misma llamada.
-        betas=["server-side-fallback-2026-07-01"],
-        extra_body={"fallbacks": "default"},
-        **extra,
-    )
-
-    # Igual que en el loop agéntico: decidimos por stop_reason, no por el texto.
-    if response.stop_reason != "end_turn":
-        raise RuntimeError(f"stop_reason inesperado: {response.stop_reason}")
-
-    return "".join(block.text for block in response.content if block.type == "text")
-
-
 def decompose(client: anthropic.Anthropic, topic: str) -> list[dict]:
     """Descompone el tema en >= MIN_SUBTOPICS subtemas: [{"name", "focus"}, ...]."""
     prompt = (
@@ -176,7 +159,33 @@ def decompose(client: anthropic.Anthropic, topic: str) -> list[dict]:
     raise RuntimeError(f"La descomposición no alcanzó {MIN_SUBTOPICS} subtemas.")
 
 
-def run_coordinator(topic: str) -> ResearchReport:
+def research_subtopic(
+    client: anthropic.Anthropic, topic: str, goal: str, subtopic: dict
+) -> dict:
+    """Cadena web -> análisis para UN subtema. El hub hace de puente entre ambos."""
+    print(f"[delegar] web_search_agent -> {subtopic['name']}")
+    findings = web_search_agent(client, topic, goal, subtopic)
+
+    # Los spokes no se comunican: el coordinador toma la salida del primero y
+    # la incluye explícitamente en el prompt del segundo.
+    print(f"[delegar] document_analysis_agent -> {subtopic['name']}")
+    section = document_analysis_agent(client, topic, goal, subtopic, findings)
+
+    return {"findings": findings, "section": section}
+
+
+def delegate(
+    client: anthropic.Anthropic, topic: str, goal: str, subtopics: list[dict]
+) -> dict[str, dict]:
+    """Delega todos los subtemas en paralelo: {nombre: {"findings", "section"}}."""
+    with ThreadPoolExecutor(max_workers=len(subtopics)) as pool:
+        results = pool.map(
+            lambda sub: research_subtopic(client, topic, goal, sub), subtopics
+        )
+        return {sub["name"]: result for sub, result in zip(subtopics, results)}
+
+
+def run_coordinator(topic: str, goal: str = DEFAULT_GOAL) -> ResearchReport:
     """Punto de entrada: recibe un tema amplio y devuelve un reporte estructurado."""
     # Sin api_key explícita, el SDK la toma de ANTHROPIC_API_KEY.
     client = anthropic.Anthropic()
@@ -186,25 +195,16 @@ def run_coordinator(topic: str) -> ResearchReport:
     for sub in subtopics:
         print(f"    - {sub['name']}: {sub['focus']}")
 
-    # Todavía sin subagentes: el hub escribe un panorama general él mismo,
-    # ahora guiado por los subtemas. En los pasos siguientes esto se reemplaza por:
-    #   results   = delegate(subtopics, ...)    -> Paso 3
+    # Paso 3: el hub delega cada subtema a los spokes con contexto explícito.
+    # En los pasos siguientes se agrega:
     #   coverage  = evaluate(results, ...)      -> Paso 4
     #   loop de refinamiento sobre los huecos   -> Paso 5
-    subtopic_names = [sub["name"] for sub in subtopics]
-    overview = call_claude(
-        client,
-        COORDINATOR_SYSTEM_PROMPT,
-        f"Tema de investigación: {topic}\n"
-        f"Subtemas: {', '.join(subtopic_names)}\n\n"
-        "Por ahora no tienes subagentes disponibles. Escribe un panorama general "
-        "breve del tema que mencione cada subtema (máximo 300 palabras).",
-    )
+    results = delegate(client, topic, goal, subtopics)
 
     return ResearchReport(
         topic=topic,
-        subtopics=subtopic_names,
-        sections={"Panorama general": overview},
+        subtopics=[sub["name"] for sub in subtopics],
+        sections={name: result["section"] for name, result in results.items()},
         iterations=1,
     )
 
